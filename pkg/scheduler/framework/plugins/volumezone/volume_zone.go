@@ -20,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
-	"sort"
 
 	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
@@ -257,12 +255,12 @@ func (pl *VolumeZone) EventsToRegister() []framework.ClusterEventWithHint {
 		// As a workaround, we add UpdateNodeTaint event to catch the case.
 		// We can remove UpdateNodeTaint when we remove the preCheck feature.
 		// See: https://github.com/kubernetes/kubernetes/issues/110175
-		{Event: framework.ClusterEvent{Resource: framework.Node, ActionType: framework.Add | framework.UpdateNodeLabel | framework.UpdateNodeTaint}, QueueingHintFn: pl.isSchedulableAfterNodeChange},
+		{Event: framework.ClusterEvent{Resource: framework.Node, ActionType: framework.Add | framework.UpdateNodeLabel | framework.UpdateNodeTaint}},
 		// A new pvc may make a pod schedulable.
-		// PVC's VolumeName is mutable if old PVC's volumeName is empty.
-		{Event: framework.ClusterEvent{Resource: framework.PersistentVolumeClaim, ActionType: framework.Add | framework.Update}, QueueingHintFn: pl.isSchedulableAfterPersistentVolumeClaimChange},
+		// Due to fields are immutable except `spec.resources`, pvc update events are ignored.
+		{Event: framework.ClusterEvent{Resource: framework.PersistentVolumeClaim, ActionType: framework.Add}},
 		// A new pv or updating a pv's volume zone labels may make a pod schedulable.
-		{Event: framework.ClusterEvent{Resource: framework.PersistentVolume, ActionType: framework.Add | framework.Update}, QueueingHintFn: pl.isSchedulableAfterPersistentVolumeChange},
+		{Event: framework.ClusterEvent{Resource: framework.PersistentVolume, ActionType: framework.Add | framework.Update}},
 	}
 }
 
@@ -314,36 +312,6 @@ func (pl *VolumeZone) isSchedulableAfterStorageClassAdded(logger klog.Logger, po
 	return framework.QueueSkip, nil
 }
 
-// isSchedulableAfterNodeChange is invoked whenever a node added or updated.
-// It checks whether the change of Node has made a previously unschedulable pod schedulable.
-// If the node label related to pod's pv topology is changed, it could make the pod schedulable.
-func (pl *VolumeZone) isSchedulableAfterNodeChange(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (framework.QueueingHint, error) {
-	originalNode, modifiedNode, err := util.As[*v1.Node](oldObj, newObj)
-	if err != nil {
-		return framework.Queue, fmt.Errorf("unexpected objects in isSchedulableAfterNodeChange: %w", err)
-	}
-
-	podPVTopologies, status := pl.getPVbyPod(logger, pod)
-	if !status.IsSuccess() {
-		return framework.Queue, status.AsError()
-	}
-	_, isMatched := pl.isSchedulableNode(logger, podPVTopologies, modifiedNode, pod)
-	if !isMatched {
-		logger.V(5).Info("node was created or updated but it doesn't make this pod schedulable", "pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
-		return framework.QueueSkip, nil
-	}
-	wasMatched := false
-	if originalNode != nil {
-		_, wasMatched = pl.isSchedulableNode(logger, podPVTopologies, originalNode, pod)
-	}
-	if !wasMatched {
-		logger.V(5).Info("node was created or updated, which might make the pod schedulable", "pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
-		return framework.Queue, nil
-	}
-	logger.V(5).Info("node was created or updated but it doesn't make this pod schedulable", "pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
-	return framework.QueueSkip, nil
-}
-
 // isSchedulablerNode checks whether the node can schedule the pod.
 func (pl *VolumeZone) isSchedulableNode(logger klog.Logger, podPVTopologies []pvTopology, node *v1.Node, pod *v1.Pod) (*framework.Status, bool) {
 	hasAnyNodeConstraint := false
@@ -374,83 +342,6 @@ func (pl *VolumeZone) isSchedulableNode(logger klog.Logger, podPVTopologies []pv
 	return nil, true
 }
 
-// isSchedulableAfterPersistentVolumeClaimChange is invoked whenever a PersistentVolumeClaim added or updated.
-// It checks whether the change of PVC has made a previously unschedulable pod schedulable.
-// A PVC becoming bound or using a WaitForFirstConsumer storageclass can cause the pod to become schedulable.
-func (pl *VolumeZone) isSchedulableAfterPersistentVolumeClaimChange(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (framework.QueueingHint, error) {
-	originalPVC, modifiedPVC, err := util.As[*v1.PersistentVolumeClaim](oldObj, newObj)
-	if err != nil {
-		return framework.Queue, fmt.Errorf("unexpected objects in isSchedulableAfterPersistentVolumeClaimChange: %w", err)
-	}
-	isMatched := pl.checkPVCBindingToPodPV(logger, modifiedPVC, pod)
-	// updated PVC is not schedulable because PVC doesn't match the pod's PVC
-	if !isMatched {
-		logger.V(5).Info("PVC was created or updated but it doesn't make this pod schedulable.", "pod", klog.KObj(pod), "PVC", klog.KObj(modifiedPVC))
-		return framework.QueueSkip, nil
-	}
-	wasMatched := pl.checkPVCBindingToPodPV(logger, originalPVC, pod)
-	// the PVC that didn't match the pod now matches the pod
-	if isMatched && !wasMatched {
-		logger.V(5).Info("PVC was created or updated, which might make the pod schedulable. The given PVC matches the pod's PVC", "pod", klog.KObj(pod), "PVC", klog.KObj(modifiedPVC))
-		return framework.Queue, nil
-	}
-	logger.V(5).Info("PVC was created or updated but it doesn't make this pod schedulable. Nothing has changed about PV bound to PVC.", "pod", klog.KObj(pod), "PVC", klog.KObj(modifiedPVC))
-	return framework.QueueSkip, nil
-}
-
-// checkPVCBindingToPodPV verifies if the PVC is bound to PV of a given Pod.
-func (pl *VolumeZone) checkPVCBindingToPodPV(logger klog.Logger, pvc *v1.PersistentVolumeClaim, pod *v1.Pod) bool {
-	if pvc == nil {
-		return false
-	}
-	pvcNames := pl.getPersistentVolumeClaimNameFromPod(pod)
-	for _, pvcName := range pvcNames {
-		if (pvc.Name != pvcName) || (pod.Namespace != pvc.Namespace) {
-			// pod's PVC doesn't match with the given PVC
-			continue
-		}
-		logger.V(5).Info("PVC matches the pod's PVC", "pod", klog.KObj(pod), "PVC", klog.KObj(pvc))
-		pvName := pvc.Spec.VolumeName
-		if pvName == "" {
-			scName := storagehelpers.GetPersistentVolumeClaimClass(pvc)
-			if len(scName) == 0 {
-				return false
-			}
-			isWait, _ := pl.isWaitForFirstConsumer(scName)
-			if !isWait {
-				logger.V(5).Info("PVC is bound to storageClass but the volumeBindingMode is not WaitForFirstConsumer", "storageClass", scName)
-				return false
-			}
-		}
-		return true
-	}
-
-	logger.V(5).Info("PVC doesn't match the pod's PVC", "pod", klog.KObj(pod), "PVC", klog.KObj(pvc))
-	return false
-}
-
-// isSchedulableAfterPersistentVolumeChange is invoked whenever a PersistentVolume added or updated.
-// It checks whether the change of PVC has made a previously unschedulable pod schedulable.
-// Changing the PV topology labels could cause the pod to become schedulable.
-func (pl *VolumeZone) isSchedulableAfterPersistentVolumeChange(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (framework.QueueingHint, error) {
-	originalPV, modifiedPV, err := util.As[*v1.PersistentVolume](oldObj, newObj)
-	if err != nil {
-		return framework.Queue, fmt.Errorf("unexpected objects in isSchedulableAfterPersistentVolumeChange: %w", err)
-	}
-	originalPVTopologies := make([]pvTopology, 0)
-	if originalPV != nil {
-		originalPVTopologies, _ = pl.getPVTopologiesAndSort(logger, pod, originalPV)
-	}
-	modifiedPVTopologies, isPodBoundToPV := pl.getPVTopologiesAndSort(logger, pod, modifiedPV)
-	if isPodBoundToPV && !reflect.DeepEqual(originalPVTopologies, modifiedPVTopologies) {
-		logger.V(5).Info("PV was created or updated, which might make the pod schedulable", "pod", klog.KObj(pod), "PV", klog.KObj(modifiedPV))
-		return framework.Queue, nil
-	}
-
-	logger.V(5).Info("PV was created or updated, but it doesn't make this pod schedulable", "pod", klog.KObj(pod), "PV", klog.KObj(modifiedPV))
-	return framework.QueueSkip, nil
-}
-
 // getPVTopologiesFromPV retrieves pvTopology from a given PV and returns the array
 func (pl *VolumeZone) getPVTopologiesFromPV(logger klog.Logger, pv *v1.PersistentVolume) []pvTopology {
 	podPVTopologies := make([]pvTopology, 0)
@@ -469,38 +360,6 @@ func (pl *VolumeZone) getPVTopologiesFromPV(logger klog.Logger, pv *v1.Persisten
 		}
 	}
 	return podPVTopologies
-}
-
-// getPVTopologiesAndSort checks whether target PV is bound to pod's PVC.
-// If PV is bound to pod's PVC, get PVTopologies and Sort.
-func (pl *VolumeZone) getPVTopologiesAndSort(logger klog.Logger, pod *v1.Pod, pv *v1.PersistentVolume) ([]pvTopology, bool) {
-	isPodBoundToPV := false
-	podPVTopologies := make([]pvTopology, 0)
-
-	pvcNames := pl.getPersistentVolumeClaimNameFromPod(pod)
-	for _, pvcName := range pvcNames {
-		pvc, err := pl.pvcLister.PersistentVolumeClaims(pod.Namespace).Get(pvcName)
-		if err != nil {
-			logger.Error(err, "unexpected error during getting PVC", "Namespace", pod.Namespace, "pvc", pvcName)
-			continue
-		}
-
-		// If target PV is bound to pod's PVC, get PVTopologies
-		pvName := pvc.Spec.VolumeName
-		if pvName == pv.Name {
-			isPodBoundToPV = true
-			podPVTopologies = append(podPVTopologies, pl.getPVTopologiesFromPV(logger, pv)...)
-			// One PV is bound to one PVC. One PV can't be bound to more than one PVC.
-			break
-		}
-	}
-	// Sort PVTopologies based on key order
-	sort.Slice(podPVTopologies, func(i, j int) bool {
-		// One PV is bound to one PVC. One PV can't be bound to more than one PVC.
-		// That's why we don't use pvName here. We use key for sorting podPVTopologies.
-		return podPVTopologies[i].key > podPVTopologies[j].key
-	})
-	return podPVTopologies, isPodBoundToPV
 }
 
 // New initializes a new plugin and returns it.
