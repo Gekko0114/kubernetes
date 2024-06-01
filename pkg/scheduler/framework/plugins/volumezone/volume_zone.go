@@ -300,20 +300,6 @@ func (pl *VolumeZone) EventsToRegister() []framework.ClusterEventWithHint {
 	}
 }
 
-// getPersistentVolumeClaimNameFromPod gets pvc names bound to a pod.
-func (pl *VolumeZone) getPersistentVolumeClaimNameFromPod(pod *v1.Pod) []string {
-	var pvcNames []string
-	for i := range pod.Spec.Volumes {
-		volume := pod.Spec.Volumes[i]
-		if volume.PersistentVolumeClaim == nil {
-			continue
-		}
-		pvcName := volume.PersistentVolumeClaim.ClaimName
-		pvcNames = append(pvcNames, pvcName)
-	}
-	return pvcNames
-}
-
 // isSchedulableAfterStorageClassAdded is invoked whenever a StorageClass is added.
 // It checks whether the addition of StorageClass has made a previously unschedulable pod schedulable.
 // Only a new StorageClass with WaitForFirstConsumer will cause a pod to become schedulable.
