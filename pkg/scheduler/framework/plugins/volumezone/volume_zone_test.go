@@ -603,10 +603,18 @@ func TestIsSchedulableAfterStorageClassAdded(t *testing.T) {
 			},
 			expectedHint: framework.QueueSkip,
 		},
-		"pvc-was-bound-to-added-sc-and-wait-mode": {
+		"pvc-was-bound-to-added-sc-and-wait-for-first-consumer-mode": {
 			pod: createPodWithVolume("pod_1", "PVC_3"),
 			newObj: &storagev1.StorageClass{
 				ObjectMeta:        metav1.ObjectMeta{Name: "SC_3"},
+				VolumeBindingMode: &modeWait,
+			},
+			expectedHint: framework.Queue,
+		},
+		"new-sc-is-not-bound-to-pvc-but-wait-for-first-consumer-mode": {
+			pod: createPodWithVolume("pod_1", "PVC_3"),
+			newObj: &storagev1.StorageClass{
+				ObjectMeta:        metav1.ObjectMeta{Name: "SC_4"},
 				VolumeBindingMode: &modeWait,
 			},
 			expectedHint: framework.Queue,

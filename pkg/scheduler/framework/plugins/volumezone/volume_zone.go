@@ -122,8 +122,12 @@ func (pl *VolumeZone) PreFilter(ctx context.Context, cs *framework.CycleState, p
 func (pl *VolumeZone) getPVbyPod(logger klog.Logger, pod *v1.Pod) ([]pvTopology, *framework.Status) {
 	podPVTopologies := make([]pvTopology, 0)
 
-	pvcNames := pl.getPersistentVolumeClaimNameFromPod(pod)
-	for _, pvcName := range pvcNames {
+	for i := range pod.Spec.Volumes {
+		volume := pod.Spec.Volumes[i]
+		if volume.PersistentVolumeClaim == nil {
+			continue
+		}
+		pvcName := volume.PersistentVolumeClaim.ClaimName
 		if pvcName == "" {
 			return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, "PersistentVolumeClaim had no name")
 		}
@@ -158,6 +162,7 @@ func (pl *VolumeZone) getPVbyPod(logger klog.Logger, pod *v1.Pod) ([]pvTopology,
 		if s := getErrorAsStatus(err); !s.IsSuccess() {
 			return nil, s
 		}
+
 		for _, key := range topologyLabels {
 			if value, ok := pv.ObjectMeta.Labels[key]; ok {
 				volumeVSet, err := volumehelpers.LabelZonesToSet(value)
@@ -317,30 +322,13 @@ func (pl *VolumeZone) isSchedulableAfterStorageClassAdded(logger klog.Logger, po
 	if err != nil {
 		return framework.Queue, fmt.Errorf("unexpected objects in isSchedulableAfterStorageClassAdded: %w", err)
 	}
-
-	pvcNames := pl.getPersistentVolumeClaimNameFromPod(pod)
-	for _, pvcName := range pvcNames {
-		pvc, err := pl.pvcLister.PersistentVolumeClaims(pod.Namespace).Get(pvcName)
-		if err != nil {
-			logger.Error(err, "unexpected error during getting PVC", "Namespace", pod.Namespace, "pvc", pvcName)
-			continue
-		}
-		pvName := pvc.Spec.VolumeName
-		if pvName != "" {
-			// We can skip PersistentVolume because we only want to check storageClass
-			continue
-		}
-		scName := storagehelpers.GetPersistentVolumeClaimClass(pvc)
-		if scName == addedStorageClass.Name {
-			if (addedStorageClass.VolumeBindingMode != nil) && (*addedStorageClass.VolumeBindingMode == storage.VolumeBindingWaitForFirstConsumer) {
-				logger.V(5).Info("a new WaitForFirstConsumer storageClass for the pod's PVC is created, which might make the pod schedulable", "storageClass", klog.KObj(addedStorageClass), "pod", klog.KObj(pod))
-				return framework.Queue, nil
-			}
-		}
+	if (addedStorageClass.VolumeBindingMode == nil) || (*addedStorageClass.VolumeBindingMode != storage.VolumeBindingWaitForFirstConsumer) {
+		logger.V(5).Info("a new storageClass is created, which can't make the pod schedulable. VolumeBindingMode is not waitForFirstConsumer", "storageClass", klog.KObj(addedStorageClass), "pod", klog.KObj(pod))
+		return framework.QueueSkip, nil
 	}
 
-	logger.V(5).Info("StorageClass was created but it doesn't make this pod schedulable", "pod", klog.KObj(pod), "StorageClass", klog.KObj(addedStorageClass))
-	return framework.QueueSkip, nil
+	logger.V(5).Info("StorageClass was created and it might make this pod schedulable", "pod", klog.KObj(pod), "StorageClass", klog.KObj(addedStorageClass))
+	return framework.Queue, nil
 }
 
 // New initializes a new plugin and returns it.
